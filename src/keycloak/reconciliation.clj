@@ -102,7 +102,7 @@
                                                  user))))]
         (utils/pprint-to-file (str "/tmp/" realm-name "-current-users.edn") current-users)
         {:user/updates   (find-differents :username current-users filtered-desired-users [:username :first-name :last-name :email :attributes :groups])
-         :user/deletions (find-deletions  :username current-users desired-users)
+         :user/deletions (when (:apply-deletions? opts) (find-deletions  :username current-users desired-users))
          :user/additions (find-additions  :username current-users desired-users)}))))
 
 (defn apply-users-plan! [keycloak-client realm-name plan & [opts]]
@@ -136,7 +136,7 @@
                                                                                                                  :client-roles {:client-id1  [\"role2\"]}}}
   return a map with keys as :realm-role-mapping/additions and deletions with a map of user to roles
   NB: only realm roles for the moment"
-  [keycloak-client realm-name roles desired-role-mappings]
+  [keycloak-client realm-name roles desired-role-mappings & [opts]]
   (let [current-realm-role-mappings  (into {} (map (fn [[role user-reps]]
                                                      [role (map #(.getUsername %) user-reps)]) (user/get-users-aggregated-by-realm-roles keycloak-client realm-name roles)))
         desired-realm-role-mappings  (merge (into {} (map (fn [role] [role nil]) roles));to take into account avery roles in the realm, even the ones not in the desired states for proper deletions
@@ -159,14 +159,15 @@
                        (utils/aggregate-keys-by-values)
                        (map (fn [[username realm-roles]] {:username username :realm-roles realm-roles}))
                        vec)
-        deletions (->> desired-realm-role-mappings
-                       (map (fn [[role users]]
-                              (when role
-                                [role (find-deletions identity (get current-realm-role-mappings role) users)])))
-                       (into {})
-                       (utils/aggregate-keys-by-values)
-                       (map (fn [[username realm-roles]] {:username username :realm-roles realm-roles}))
-                       vec)]
+        deletions (when (:apply-deletions? opts)
+                    (->> desired-realm-role-mappings
+                         (map (fn [[role users]]
+                                (when role
+                                  [role (find-deletions identity (get current-realm-role-mappings role) users)])))
+                         (into {})
+                         (utils/aggregate-keys-by-values)
+                         (map (fn [[username realm-roles]] {:username username :realm-roles realm-roles}))
+                         vec))]
     {:realm-role-mappings/additions additions
      :realm-role-mappings/deletions deletions}))
 
@@ -191,13 +192,13 @@
   (let [subgroup-path (str "/" parent-group-name "/" (:name subgroup))]
     (assoc subgroup :path subgroup-path)))
 
-(defn groups-plan [keycloak-client realm-name desired-groups]
+(defn groups-plan [keycloak-client realm-name desired-groups & [opts]]
   (let [current-groups         (map bean/GroupRepresentation->map (admin/list-groups keycloak-client realm-name))
         current-groups-by-id   (utils/associate-by :id current-groups)
         current-groups-by-name (utils/associate-by :name current-groups)]
     (utils/pprint-to-file (str "/tmp/" realm-name "-current-groups.edn") current-groups)
     {:groups/additions    (find-additions :name current-groups desired-groups)
-     :groups/deletions    (find-deletions :name current-groups desired-groups)
+     :groups/deletions    (when (:apply-deletions? opts) (find-deletions :name current-groups desired-groups))
      :subgroups/additions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
                                     (let [current-group     (get current-groups-by-name name)
                                           group-id          (:id current-group)
@@ -207,17 +208,18 @@
                                                (-> subgroup-to-add
                                                    (assoc :parent-group-id group-id)
                                                    (assoc :parent-group-name name))) (find-additions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)
-     :subgroups/deletions (mapcat (fn [{:keys [name subgroups] :as desired-group}]
-                                    (let [current-group     (get current-groups-by-name name)
-                                          group-id          (:id current-group)
-                                          current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
-                                      (when group-id
-                                        (map (fn [subgroup-to-delete]
-                                               (-> subgroup-to-delete
-                                                   (assoc :id (admin/get-subgroup-id keycloak-client realm-name group-id (:name subgroup-to-delete)))
-                                                   (assoc :parent-group-id group-id)
-                                                   (assoc :parent-group-name name)))
-                                             (find-deletions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups)}))
+     :subgroups/deletions (when (:apply-deletions? opts)
+                            (mapcat (fn [{:keys [name subgroups] :as desired-group}]
+                                      (let [current-group     (get current-groups-by-name name)
+                                            group-id          (:id current-group)
+                                            current-subgroups (map bean/GroupRepresentation->map (:subGroups current-group))]
+                                        (when group-id
+                                          (map (fn [subgroup-to-delete]
+                                                 (-> subgroup-to-delete
+                                                     (assoc :id (admin/get-subgroup-id keycloak-client realm-name group-id (:name subgroup-to-delete)))
+                                                     (assoc :parent-group-id group-id)
+                                                     (assoc :parent-group-name name)))
+                                               (find-deletions :path current-subgroups (map (partial subgroup-path name) subgroups)))))) desired-groups))}))
 
 
 (defn apply-groups-plan! [keycloak-client realm-name plan & [opts]]
@@ -234,7 +236,7 @@
                                                                  deleted-group))}
                           :subgroups/additions {:apply-fn    (fn apply-subgroup-addition-step [{:keys [name parent-group-id parent-group-name] :as subgroup}]
                                                                (let [created-group (bean/GroupRepresentation->map (admin/create-subgroup! keycloak-client realm-name parent-group-id name))]
-                                                              (println (format "Subgroup \"%s\" of group \"%s\" created" name parent-group-name))))
+                                                                 (println (format "Subgroup \"%s\" of group \"%s\" created" name parent-group-name))))
                                                 :rollback-fn (fn rollback-subgroup-addition-step [subgroup]
                                                                (admin/delete-group! keycloak-client realm-name (admin/get-group-id keycloak-client realm-name (:name subgroup))))}
                           :groups/deletions    {:apply-fn    (fn apply-group-deletion-step [group]
@@ -271,11 +273,11 @@
   (println (format "will reconciliate users roles mappings of realm %s, dry-run? %s" realm-name (boolean (:dry-run? opts))))
   (let [dry-run?     (or (:dry-run? opts) false)
         users->roles (utils/associate-by :username users)
-        plan         (role-mappings-plan admin-client realm-name roles users->roles)
+        plan         (role-mappings-plan admin-client realm-name roles users->roles opts)
         _            (do (println "User Role Mappings reconciliation plan is:") (clojure.pprint/pprint plan)
                          (utils/pprint-to-temp-file (str realm-name "-role-mappings-reconciliation-plan-") plan))
         report       (when (not dry-run?)
-                       (println "Will apply the previous User-Role Mappings reconciliation plan! apply-deletions?" (:apply-deletions? opts) )
+                       (println "Will apply the previous User-Role Mappings reconciliation plan! apply-deletions?" (:apply-deletions? opts))
                        (apply-role-mappings-plan! admin-client realm-name plan opts))]
     (when report
       (utils/pprint-to-temp-file (str realm-name "-role-mappings-reconciliation-report-") report)
@@ -284,7 +286,7 @@
 (defn reconciliate-groups! [^org.keycloak.admin.client.Keycloak admin-client realm-name groups & [opts]]
   (println (format "Will reconciliate Groups and Subgroups of realm %s, dry-run? %s" realm-name (boolean (:dry-run? opts))))
   (let [dry-run? (or (:dry-run? opts) false)
-        plan     (groups-plan admin-client realm-name groups)
+        plan     (groups-plan admin-client realm-name groups opts)
         _        (do (println "Groups reconciliation plan is:") (clojure.pprint/pprint plan)
                      (utils/pprint-to-temp-file (str realm-name "-groups-reconciliation-plan-") plan))
         report   (when (not dry-run?)
